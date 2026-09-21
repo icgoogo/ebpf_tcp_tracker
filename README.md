@@ -8,7 +8,6 @@ An in-kernel connection tracker built with eBPF to observe TCP flows, validate p
 
 This project explores how stateful packet processing can be implemented close to the Linux networking data path. It tracks the TCP three-way handshake, established connections, connection teardown, reset packets, and expired entries while forwarding packets between a client and a server.
 
-> [View the source repository](https://example.com)
 
 ## Architecture
 
@@ -111,13 +110,6 @@ The project is intended for a Linux environment with:
 
 ## Running the Project
 
-Clone the repository and follow its setup script or Makefile to create the namespaces, compile the program, and attach it to the virtual interfaces:
-
-```bash
-git clone https://example.com
-cd ebpf-tcp-connection-tracker
-```
-
 Because eBPF attachment commands and interface indices depend on the host, check the repository's build and setup targets before running them. After attachment, generate TCP traffic between `10.0.0.1` and `10.0.0.2`, then watch `trace_pipe` to verify the state transitions.
 
 ## Key Takeaways
@@ -132,10 +124,3 @@ This project demonstrates practical experience with eBPF packet processing, Linu
 - Add IPv6 support
 - Benchmark throughput, latency, and map pressure under concurrent connections
 
-## Project Link
-
-Source code and implementation details: [https://example.com](https://example.com)
-
-## License
-
-Add the license used by the source repository here.

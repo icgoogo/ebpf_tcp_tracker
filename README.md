@@ -1,126 +1,221 @@
-# eBPF TCP Connection Tracker
+# eBPF TCP/UDP Connection Tracker
 
-[![Linux](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)](https://www.kernel.org/)
-[![eBPF](https://img.shields.io/badge/kernel-eBPF-F7C948)](https://ebpf.io/)
-[![Language](https://img.shields.io/badge/language-C-00599C?logo=c&logoColor=white)](https://en.wikipedia.org/wiki/C_(programming_language))
+An in-kernel, stateful connection tracker implemented as an eBPF/XDP program. It parses IPv4 TCP and UDP traffic directly on the fast data path, normalizes bidirectional flows into BPF hash maps, validates state transitions, handles teardowns and timeouts, and redirects accepted packets between isolated Linux network namespaces.
 
-An in-kernel connection tracker built with eBPF to observe TCP flows, validate packet transitions, and maintain per-flow state as traffic moves between isolated Linux network namespaces.
+**Repository:** [github.com/icgoogo/ebpf_tcp_tracker](https://github.com/icgoogo/ebpf_tcp_tracker?utm_source=gemini)
 
-This project explores how stateful packet processing can be implemented close to the Linux networking data path. It tracks the TCP three-way handshake, established connections, connection teardown, reset packets, and expired entries while forwarding packets between a client and a server.
+---
 
+## Why This Project
 
-## Architecture
+Linux standard `conntrack` operates deeper within the kernel networking stack. Rebuilding a stateful connection tracker at the XDP (eXpress Data Path) layer allows exploring:
 
-The test environment uses two Linux network namespaces connected through a pair of virtual Ethernet interfaces. The eBPF program inspects packets on the forwarding path and stores connection state in a BPF map.
+- Verifier-safe packet parsing with explicit bounds checks
+- Bidirectional flow key normalization
+- In-kernel TCP and UDP state machine tracking
+- Concurrency-safe BPF map updates using `bpf_spin_lock`
+- Fine-grained timeout, reset, and stale entry cleanup
+- High-performance, line-rate packet forwarding using `bpf_redirect`
 
-![eBPF connection tracker architecture](docs/images/architecture.png)
+---
 
-| Component | Role |
-| --- | --- |
-| `ns1` | Client namespace at `10.0.0.1/24` |
-| `ns2` | Server namespace at `10.0.0.2/24` |
-| `veth1` and `veth2` | Virtual interfaces carrying traffic between the namespaces |
-| eBPF connection tracker | Parses packets, looks up flow state, validates transitions, updates the map, and redirects or drops traffic |
-| BPF connection map | Stores state and timeout information for each flow |
+## Architecture & Topology
 
-## What It Tracks
+![architecture topology](docs/images/architecture.png)
+The lab topology uses two Linux network namespaces (`ns1` as client and `ns2` as server) connected through a pair of virtual Ethernet interfaces. The eBPF/XDP tracker attaches to the forwarding interfaces, inspecting traffic and managing connection state in shared BPF maps.
 
-- TCP flow identity using source and destination addresses, ports, and transport protocol
-- Forward and reverse traffic for the same connection
-- The three-way handshake from `SYN_SENT` through `SYN_RECV` to `ESTABLISHED`
-- Active and passive connection termination using `FIN` and `ACK`
-- `TIME_WAIT` expiration without continuously extending its lifetime
-- Reset handling by removing the matching map entry and dropping the RST packet
-- Lightweight UDP flow tracking with request, established, and expired states
-- Stale connection detection using per-entry time-to-live values
+| Component          | Role / Purpose                                        |
+| ------------------ | ----------------------------------------------------- |
+| `ns1` / `10.0.0.1` | Client network namespace                              |
+| `ns2` / `10.0.0.2` | Server network namespace                              |
+| `veth1`, `veth2`   | Host-side interfaces attached to the XDP tracker      |
+| `veth1_`, `veth2_` | Namespace-side virtual Ethernet interfaces            |
+| `connections`      | Hash map storing up to 65,536 normalized active flows |
+| `metadata`         | Per-CPU array map for packet and byte metrics         |
 
-## TCP State Model
+---
 
-The tracker follows the standard TCP lifecycle and keeps both directions synchronized as packets traverse the eBPF hook.
+## Packet Processing Pipeline
 
-![TCP connection state machine](docs/images/tcp-state-machine.jpg)
+Every incoming packet on the XDP hook traverses a multi-step validation and redirection flow:
 
-The core path implemented and tested by the project is:
+```mermaid
+flowchart TD
+    RX[Packet at XDP hook] --> PARSE{Valid Ethernet + IPv4 + TCP/UDP?}
+    PARSE -- No --> DROP[XDP_DROP]
+    PARSE -- Yes --> KEY[Normalize 5-tuple key]
+    KEY --> LOOKUP{Flow in BPF map?}
+    LOOKUP -- No --> NEW{Valid initial packet?}
+    LOOKUP -- Yes --> CHECK[Validate direction, state, seq/ack & flags]
+    NEW -- No --> DROP
+    NEW -- Yes --> UPDATE[Create map entry with spinlock]
+    CHECK -- Invalid/Expired --> DROP
+    CHECK -- Valid --> UPDATE
+    UPDATE --> REDIRECT[bpf_redirect to peer interface]
 
-```text
-CLOSED -> SYN_SENT -> SYN_RECV -> ESTABLISHED
-       -> FIN_WAIT_1 -> FIN_WAIT_2 -> TIME_WAIT -> CLOSED
-
-Peer-initiated close:
-ESTABLISHED -> CLOSE_WAIT -> LAST_ACK -> CLOSED
 ```
 
-## Packet Processing Flow
+### Processing Steps
 
-For every packet, the program:
+1. **Header Parsing:** Validates Ethernet II framing, supports up to two VLAN headers, and parses IPv4 headers. Non-IPv4, ARP, and non-TCP/UDP traffic are dropped.
+2. **Key Normalization:** Constructs a normalized 5-tuple flow key where IP addresses and ports are sorted deterministically so forward and reverse traffic resolve to the same map entry.
+3. **Map Lookup & Validation:** Queries the `connections` BPF hash map.
 
-1. Parses the network and transport headers.
-2. Builds a flow key and determines the packet direction.
-3. Looks up the connection in the BPF map.
-4. Creates a new entry for an allowed initial packet or validates the transition of an existing entry.
-5. Updates sequence, acknowledgement, state, and timeout data while holding the entry lock where required.
-6. Redirects an accepted packet to the peer interface or drops an invalid, expired, or reset flow.
+- **Existing Flow:** Checks connection direction, state flags, sequence/acknowledgement numbers, and TTL.
+- **New Flow:** Verifies whether the packet is a valid initiation (e.g., TCP SYN or initial UDP request).
 
-## Connection Establishment
+4. **State Lock & Update:** Acquires a `bpf_spin_lock` on the map entry to atomically update state, expected sequences, and timeouts.
+5. **Action Execution:** Redirects allowed packets to the peer interface (`XDP_REDIRECT`) or drops invalid, expired, or reset traffic (`XDP_DROP`).
 
-The trace below shows the complete three-way handshake being recognized by the tracker. A client SYN creates the flow, the reverse SYN+ACK moves it to `SYN_RECV`, and the final ACK changes the state to `ESTABLISHED`.
+---
 
-![Trace output showing a successful TCP handshake](docs/images/handshake-trace.png)
+## State Machine & Flow Tracking
 
-Two correctness details are important:
+### TCP State Machine
 
-- A SYN consumes one sequence number, so the SYN+ACK acknowledgement must match the original sequence number plus one.
-- The final client ACK is accepted only for a flow already in `SYN_RECV` with the expected acknowledgement number.
+The tracker observes the full TCP lifecycle across both directions. A `CLOSED` connection is represented by the removal or absence of a map entry.
+![FSM](docs/images/tcp-state-machine.jpg)
+
+### UDP Flow Tracking
+
+Since UDP is connectionless, the tracker models a lightweight flow lifecycle with per-entry TTL and hop limits:
+
+| State             | Transition Trigger     | Description                                   |
+| ----------------- | ---------------------- | --------------------------------------------- |
+| `UDP_REQUEST`     | Outbound UDP packet    | Initial packet creates the flow entry         |
+| `UDP_ESTABLISHED` | Reverse UDP response   | Reverse traffic observed; connection verified |
+| `UDP_EXPIRED`     | Inactivity TTL timeout | Stale entry removed; must be re-established   |
+
+---
 
 ## Teardown, Reset, and Expiration
 
-Connection cleanup covers graceful termination, abrupt resets, and inactivity timeouts. `TIME_WAIT` is treated specially so later packets do not keep refreshing its expiration time.
+- **TCP Handshake Strictness:** A SYN consumes one sequence number sequence space; reverse `SYN+ACK` must acknowledge `seq + 1`. The completing `ACK` is accepted only when the flow is in `SYN_RECV` with matching acknowledgement values.
+- **Reset (RST) Handling:** Receiving an `RST` packet immediately deletes the matching entry from the BPF map and drops the packet.
+- **TIME_WAIT Behavior:** `TIME_WAIT` entries carry a strict fixed expiration time so subsequent packets do not indefinitely refresh the flow lifetime.
+- **Stale Entry Cleanup:** Expired entries return to the miss path, enabling new `SYN` or `UDP` packets to replace old connections cleanly.
 
-![Implementation notes for reset, timeout, UDP, and TCP teardown handling](docs/images/teardown-and-timeout.png)
+---
 
-When an RST packet is received, the tracker removes the connection from the map and drops the packet. When an entry has expired, the packet returns to the miss path, where a valid new SYN may create a fresh connection. The teardown path supports either endpoint initiating the close.
+## Implementation Details
 
-## Observability
+### Normalized Map Key Structure
 
-During development, state transitions can be inspected through the kernel tracing pipe:
+```c
+struct ct_k {
+    uint32_t srcIp;
+    uint32_t dstIp;
+    uint8_t  l4proto;
+    uint16_t srcPort;
+    uint16_t dstPort;
+} __attribute__((packed));
+
+```
+
+Addresses and ports are ordered (smaller endpoint first) before key lookup to ensure symmetrical mapping across bidirectional traffic.
+
+### User-Space Loader & Skeleton
+
+The user-space binary relies on `libbpf` to:
+
+1. Load compiled BPF bytecode into the kernel.
+2. Attach the XDP program in native/driver mode to specified interfaces (`veth1`, `veth2`).
+3. Poll per-CPU statistics maps and display real-time telemetry.
+4. Clean up attachments gracefully on `SIGINT` or `SIGTERM`.
+
+---
+
+## Observability & Verification
+
+State transitions and packet processing decisions can be monitored in real time through the kernel tracing pipe:
 
 ```bash
 sudo cat /sys/kernel/debug/tracing/trace_pipe
+
 ```
 
-Representative transitions include:
+### Handshake Execution Trace
+
+The screenshot below demonstrates the complete three-way TCP handshake captured via `bpf_printk` during live execution:
+![execution](docs/images/terminal.png)
+
+#### Representative Log Sequence
 
 ```text
+[START] initial packet: srcIp: 16777226, dstIp: 33554442, l4proto: 6, flags: 2 (SYN)
+[TCP] TCP_MISS new incoming packet
+...
 [REV_DIRECTION] Changing state from SYN_SENT to SYN_RECV
-[FW_DIRECTION]  Changing state from SYN_RECV to ESTABLISHED
+Redirect pkt to IF1 iface with ifindex: 3
+...
+[FW_DIRECTION] Changing state from SYN_RECV to ESTABLISHED
+Redirect pkt to IF2 iface with ifindex: 5
+
 ```
 
-These trace messages make it possible to correlate packet flags, sequence numbers, interface indices, and state changes while testing the program.
+---
 
-## Environment
+## Repository Layout
 
-The project is intended for a Linux environment with:
+```text
+.
+├── conntrack.c                 # User-space loader and statistics loop
+├── conntrack_if_helper.c       # Network interface helper functions
+├── create-topo.sh              # Network namespace and veth topology generator
+├── ebpf/
+│   ├── conntrack.bpf.c         # Core XDP program and state transition logic
+│   ├── conntrack_maps.h        # Flow table and metadata map definitions
+│   ├── conntrack_parser.h      # Packet parser (Ethernet, VLAN, IPv4, TCP, UDP)
+│   └── conntrack_structs.h     # Key, value, and TCP/UDP state structures
+├── xdp_loader.c                # Auxiliary XDP pass-loader for namespace links
+└── Makefile                    # Build scripts for BPF objects and binaries
 
-- A kernel with eBPF support
-- Clang/LLVM for compiling the BPF program
-- `libbpf` and kernel headers
-- `iproute2` for network namespaces, virtual Ethernet devices, and program attachment
-- `bpftool` for inspecting loaded programs and maps
-- Root privileges or the Linux capabilities required to load and attach eBPF programs
+```
 
-## Running the Project
+---
 
-Because eBPF attachment commands and interface indices depend on the host, check the repository's build and setup targets before running them. After attachment, generate TCP traffic between `10.0.0.1` and `10.0.0.2`, then watch `trace_pipe` to verify the state transitions.
+## Build and Run Guide
 
-## Key Takeaways
+1. **Clone and Compile:**
 
-This project demonstrates practical experience with eBPF packet processing, Linux network namespaces, BPF maps, bidirectional flow normalization, concurrency-safe state updates, TCP sequence and acknowledgement validation, connection timeout handling, and kernel-level debugging.
+```bash
+git clone https://github.com/icgoogo/ebpf_tcp_tracker.git
+cd ebpf_tcp_tracker
+make
 
-## Future Improvements
+```
 
-- Replace development tracing with a ring buffer for structured user-space events
-- Add automated tests for simultaneous close, retransmissions, out-of-order packets, and malformed headers
-- Export connection metrics for visualization and performance analysis
-- Add IPv6 support
-- Benchmark throughput, latency, and map pressure under concurrent connections
+2. **Setup Network Topology:**
 
+```bash
+sudo ./create-topo.sh
+
+```
+
+3. **Launch Connection Tracker:**
+
+```bash
+sudo ./conntrack --iface1 veth1 --iface2 veth2 --log_level 5
+
+```
+
+4. **Observe Handshake & Traffic:**
+   Open a secondary terminal to inspect tracing logs:
+
+```bash
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+
+```
+
+Generate test TCP traffic using `netcat` (`nc`):
+
+```bash
+# Terminal 1: Start Server inside ns2
+sudo ip netns exec ns2 nc -l 8080
+
+# Terminal 2: Connect from Client inside ns1
+sudo ip netns exec ns1 nc 10.0.0.2 8080
+
+```
+
+---
